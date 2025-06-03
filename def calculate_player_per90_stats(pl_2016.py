@@ -15,8 +15,9 @@ def calculate_player_per90_stats(pl_2016):
     # Получаем уникальные матчи и игроков для расчета времени игры
     matches = df['match_id'].unique()
     
-    # Словарь для хранения времени игры каждого игрока
+    # Словарь для хранения времени игры каждого игрока и их позиций
     player_minutes = {}
+    player_positions = {}
     
     # Проходим по каждому матчу
     for match_id in matches:
@@ -45,10 +46,16 @@ def calculate_player_per90_stats(pl_2016):
                             for player_info in tactics_dict['lineup']:
                                 player_id = player_info['player']['id']
                                 player_name = player_info['player']['name']
+                                player_position = player_info.get('position', {}).get('name', 'Unknown')
                                 
                                 # Инициализируем время игры (90 минут по умолчанию)
                                 if player_id not in player_minutes:
                                     player_minutes[player_id] = {'name': player_name, 'total_minutes': 0}
+                                    player_positions[player_id] = []
+                                
+                                # Сохраняем позицию игрока
+                                if player_position not in player_positions[player_id]:
+                                    player_positions[player_id].append(player_position)
                                 
                                 # Проверяем, был ли игрок заменен
                                 substituted_off = team_substitutions[
@@ -74,6 +81,7 @@ def calculate_player_per90_stats(pl_2016):
                     
                     if replacement_id not in player_minutes:
                         player_minutes[replacement_id] = {'name': replacement_name, 'total_minutes': 0}
+                        player_positions[replacement_id] = []
                     
                     # Игрок, вышедший на замену, играет оставшееся время
                     player_minutes[replacement_id]['total_minutes'] += (90 - sub_minute)
@@ -90,6 +98,7 @@ def calculate_player_per90_stats(pl_2016):
                 stats = {
                     'player_id': player_id,
                     'player_name': time_data['name'],
+                    'position': ', '.join(player_positions.get(player_id, ['Unknown'])),
                     'total_minutes': time_data['total_minutes'],
                     'matches_played': len(player_events['match_id'].unique()),
                 }
@@ -129,11 +138,116 @@ def calculate_player_per90_stats(pl_2016):
                 ].shape[0]
                 stats['goals'] = goals
                 
+                # НОВЫЕ МЕТРИКИ
+                
+                # xG (Expected Goals)
+                xg_events = player_events[
+                    (player_events['type'] == 'Shot') & 
+                    (player_events['shot_statsbomb_xg'].notna())
+                ]
+                stats['xg'] = xg_events['shot_statsbomb_xg'].sum() if not xg_events.empty else 0
+                
+                # xA (Expected Assists) - из передач, которые привели к ударам
+                xa_events = player_events[
+                    (player_events['type'] == 'Pass') & 
+                    (player_events['pass_shot_assist'].notna()) &
+                    (player_events['pass_shot_assist'] == True)
+                ]
+                # Пытаемся найти xG для этих ударов
+                stats['xa'] = 0
+                for _, pass_event in xa_events.iterrows():
+                    # Ищем соответствующий удар в том же матче
+                    match_shots = df[
+                        (df['match_id'] == pass_event['match_id']) &
+                        (df['type'] == 'Shot') &
+                        (df['minute'] >= pass_event['minute']) &
+                        (df['minute'] <= pass_event['minute'] + 1)  # В течение минуты
+                    ]
+                    if not match_shots.empty:
+                        # Берем первый удар после передачи
+                        shot_xg = match_shots.iloc[0].get('shot_statsbomb_xg', 0)
+                        if pd.notna(shot_xg):
+                            stats['xa'] += shot_xg
+                
+                # Выносы в финальную треть
+                carries_final_third = player_events[
+                    (player_events['type'] == 'Carry') &
+                    (player_events['carry_end_location_x'].notna()) &
+                    (player_events['carry_end_location_x'] >= 80)  # Финальная треть (80-120 по оси X)
+                ].shape[0]
+                stats['carries_final_third'] = carries_final_third
+                
+                # Зональные касания
+                all_touches = player_events[player_events['location_x'].notna()]
+                
+                # Касания в финальной трети
+                final_third_touches = all_touches[all_touches['location_x'] >= 80].shape[0]
+                # Касания в средней трети
+                middle_third_touches = all_touches[
+                    (all_touches['location_x'] >= 40) & 
+                    (all_touches['location_x'] < 80)
+                ].shape[0]
+                # Касания в защитной трети
+                defensive_third_touches = all_touches[all_touches['location_x'] < 40].shape[0]
+                
+                total_touches = len(all_touches)
+                
+                stats['final_third_touches'] = final_third_touches
+                stats['middle_third_touches'] = middle_third_touches
+                stats['defensive_third_touches'] = defensive_third_touches
+                stats['total_touches'] = total_touches
+                
+                # Процент касаний в финальной трети
+                stats['final_third_touches_pct'] = (final_third_touches / total_touches * 100) if total_touches > 0 else 0
+                
+                # Длина передач
+                pass_events = player_events[
+                    (player_events['type'] == 'Pass') &
+                    (player_events['location_x'].notna()) &
+                    (player_events['location_y'].notna()) &
+                    (player_events['pass_end_location_x'].notna()) &
+                    (player_events['pass_end_location_y'].notna())
+                ]
+                
+                if not pass_events.empty:
+                    # Вычисляем длину каждой передачи
+                    pass_lengths = []
+                    for _, pass_event in pass_events.iterrows():
+                        start_x, start_y = pass_event['location_x'], pass_event['location_y']
+                        end_x, end_y = pass_event['pass_end_location_x'], pass_event['pass_end_location_y']
+                        length = ((end_x - start_x)**2 + (end_y - start_y)**2)**0.5
+                        pass_lengths.append(length)
+                    
+                    stats['avg_pass_length'] = sum(pass_lengths) / len(pass_lengths) if pass_lengths else 0
+                    stats['total_pass_distance'] = sum(pass_lengths)
+                else:
+                    stats['avg_pass_length'] = 0
+                    stats['total_pass_distance'] = 0
+                
+                # Прогрессивные передачи (передачи, которые продвигают мяч к воротам соперника)
+                progressive_passes = pass_events[
+                    (pass_events['location_x'] < pass_events['pass_end_location_x']) &  # Движение вперед
+                    ((pass_events['pass_end_location_x'] - pass_events['location_x']) >= 10)  # Минимум 10 метров вперед
+                ].shape[0]
+                stats['progressive_passes'] = progressive_passes
+                
+                # Длинные передачи (более 25 метров)
+                long_passes = 0
+                for _, pass_event in pass_events.iterrows():
+                    start_x, start_y = pass_event['location_x'], pass_event['location_y']
+                    end_x, end_y = pass_event['pass_end_location_x'], pass_event['pass_end_location_y']
+                    length = ((end_x - start_x)**2 + (end_y - start_y)**2)**0.5
+                    if length >= 25:
+                        long_passes += 1
+                
+                stats['long_passes'] = long_passes
+                
                 # Конвертируем в per90
                 minutes_factor = time_data['total_minutes'] / 90.0
                 
                 for key in stats.keys():
-                    if key not in ['player_id', 'player_name', 'total_minutes', 'matches_played']:
+                    if key not in ['player_id', 'player_name', 'position', 'total_minutes', 'matches_played', 
+                                   'final_third_touches_pct', 'avg_pass_length']:
                         stats[f'{key}_per90'] = stats[key] / minutes_factor if minutes_factor > 0 else 0
                 
                 # Процентные показатели
@@ -146,6 +260,12 @@ def calculate_player_per90_stats(pl_2016):
                     stats['dribble_success_rate'] = (stats['successful_dribbles'] / stats['dribbles']) * 100
                 else:
                     stats['dribble_success_rate'] = 0
+                
+                # Прогрессивные передачи как процент от всех передач
+                if stats['passes'] > 0:
+                    stats['progressive_pass_pct'] = (stats['progressive_passes'] / stats['passes']) * 100
+                else:
+                    stats['progressive_pass_pct'] = 0
                 
                 player_stats.append(stats)
     
