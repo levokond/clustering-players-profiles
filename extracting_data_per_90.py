@@ -1,3 +1,5 @@
+import pandas as pd
+
 def calculate_player_per90_stats(pl_2016):
     """
     Группирует данные по игрокам, конвертирует в формат per90 и отфильтровывает игроков с менее чем 500 минутами
@@ -9,7 +11,6 @@ def calculate_player_per90_stats(pl_2016):
         DataFrame с статистикой per90 для игроков с >= 500 минутами
     """
     
-    import pandas as pd
     
     # Создаем копию данных для работы
     df = pl_2016.copy()
