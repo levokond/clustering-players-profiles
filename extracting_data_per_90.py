@@ -9,6 +9,8 @@ def calculate_player_per90_stats(pl_2016):
         DataFrame с статистикой per90 для игроков с >= 500 минутами
     """
     
+    import pandas as pd
+    
     # Создаем копию данных для работы
     df = pl_2016.copy()
     
