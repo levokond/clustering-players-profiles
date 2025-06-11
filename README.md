@@ -6,3 +6,4 @@ future updates:
 3. Make all the data conversion code a function
 4. get more data for initial training
 5. remember what was another point, it was something very important!!
+6. you dont needto pretrain clusterin, you need to put all data straightaway
