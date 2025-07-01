@@ -20,7 +20,6 @@ LEAGUES = {
     'Serie A':       11,
     'Ligue 1':       13,
 }
-# Stats categories: key -> URL segment ('' means overall)
 CATEGORIES = {
     'standard':    '',
     'shooting':    'shooting',
@@ -41,7 +40,7 @@ USER_AGENTS = [
     '(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0',
 ]
-PROXIES = []  # e.g. ['http://proxy1:port', ...]
+PROXIES = []
 DELAY_MIN = 3
 DELAY_MAX = 6
 MAX_RETRIES = 5
