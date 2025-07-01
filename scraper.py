@@ -1,270 +1,441 @@
 """
 FBref scraper module for match-level data extraction.
-Handles URL building and HTML parsing for six match-log categories.
+Production-ready implementation following FBref's actual URL patterns and HTML structure.
 """
 
 import os
 import time
 import random
-import pandas as pd
-import cloudscraper
-from bs4 import BeautifulSoup, Comment
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+import re
 import requests
+import pandas as pd
+from bs4 import BeautifulSoup, Comment
+from datetime import date, timedelta, datetime
+from typing import Dict, List, Optional, Tuple
+from sqlalchemy import create_engine, text
+import logging
 
-# Initialize cloudscraper session
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "desktop": True}
-)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-BASE_URL = "https://fbref.com"
+BASE = "https://fbref.com"
 
-# Top-5 leagues: name -> comp_id
+# Top-5 leagues: name -> competition-id (from FBref URLs)
 LEAGUES = {
-    'Premier League': 9,
-    'La Liga': 12,
-    'Bundesliga': 20,
-    'Serie A': 11,
-    'Ligue 1': 13,
+    "Premier League": 9,
+    "La Liga": 12,
+    "Bundesliga": 20,
+    "Serie A": 11,
+    "Ligue 1": 13,
 }
 
-# Match-log categories for the six tables
-MATCH_LOG_CATEGORIES = {
-    'passing': 'passing',
-    'pass_types': 'pass_types', 
-    'gca': 'gca',
-    'defense': 'defense',
-    'possession': 'possession',
-    'misc': 'misc',
+# League names for filtering match logs
+LEAGUE_NAMES = {
+    "Premier League", "La Liga", "Bundesliga", "Serie A", "Ligue 1"
 }
 
-# Request throttling and retry settings
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 '
-    '(KHTML, like Gecko) Version/16.5 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:117.0) Gecko/20100101 Firefox/117.0',
-]
+# Match-log categories with FBref category codes
+CODES = {
+    "passing": ("0", "passing"),
+    "pass_types": ("2", "pass_types"),
+    "gca": ("9", "gca"),
+    "defense": ("5", "defense"),
+    "poss": ("6", "possession"),
+    "misc": ("7", "misc"),
+}
 
-DELAY_MIN = 3
-DELAY_MAX = 6
-MAX_RETRIES = 5
-BACKOFF_FACTOR = 2
+# URL templates
+TEAM_TMPL = BASE + "/squads/{tid}/{season}/matchlogs/c{code}/{cat}/{team_slug}"
+PLYR_TMPL = BASE + "/players/{pid}/matchlogs/{season}/{cat}/{player_slug}"
+
+# Request settings
+DELAY_MIN = 2
+DELAY_MAX = 4
+MAX_RETRIES = 3
+TIMEOUT = 30
+
+# Look back window
+SINCE = date.today() - timedelta(days=7)
 
 
-def get_with_retries(url: str, referer: Optional[str] = None) -> requests.Response:
-    """
-    Fetch URL with retries on 429/network errors. Exponential backoff + jitter.
-    """
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        headers = {'User-Agent': random.choice(USER_AGENTS)}
-        if referer:
-            headers['Referer'] = referer
-            
+def get_with_retries(url: str) -> requests.Response:
+    """Fetch URL with retries and rate limiting."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    }
+    
+    for attempt in range(MAX_RETRIES):
         try:
-            resp = scraper.get(url, headers=headers)
-            if resp.status_code == 429:
-                raise requests.exceptions.HTTPError('429 Too Many Requests')
+            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            resp = requests.get(url, headers=headers, timeout=TIMEOUT)
             resp.raise_for_status()
             return resp
-        except Exception as e:
-            last_err = e
-            if attempt == MAX_RETRIES:
-                print(f"[Error] {url} failed after {MAX_RETRIES} attempts: {e}")
+        except requests.RequestException as e:
+            if attempt == MAX_RETRIES - 1:
+                logger.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts: {e}")
                 raise
-            wait = (BACKOFF_FACTOR ** (attempt - 1)) + random.uniform(0, 1)
-            print(f"[Retry {attempt}] {url} error: {e}. Sleeping {wait:.1f}s...")
+            wait = (2 ** attempt) + random.uniform(0, 1)
             time.sleep(wait)
-    raise last_err
+    
 
-
-def get_recent_fixtures(league_name: str, comp_id: int, days_back: int = 7) -> List[Dict]:
-    """
-    Get fixtures from the last N days for a specific league.
-    Returns list of fixture dicts with match_id, teams, date, etc.
-    """
-    print(f"Fetching recent fixtures for {league_name}...")
+def fixtures_since(league_id: int, year: int) -> List[str]:
+    """Return fixture URLs for league games played >= SINCE."""
+    url = f"{BASE}/en/comps/{league_id}/{year}-{year+1}/schedule/{year}-{year+1}-{league_id}-Scores-and-Fixtures"
+    logger.info(f"Fetching fixtures from {url}")
     
-    # Get league summary page
-    url = f"{BASE_URL}/en/comps/{comp_id}/{league_name.replace(' ', '-')}-Stats"
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-    resp = get_with_retries(url)
-    soup = BeautifulSoup(resp.text, 'lxml')
+    soup = BeautifulSoup(get_with_retries(url).text, "lxml")
+    rows = soup.select("table.stats_table tbody tr")
+    urls = []
     
-    # Find fixtures table (usually in a commented section)
-    fixtures = []
-    cutoff_date = datetime.now() - timedelta(days=days_back)
-    
-    # Look for fixtures table in commented HTML
-    fixtures_comment = soup.find(string=lambda t: isinstance(t, Comment) and 'fixtures' in str(t).lower())
-    if fixtures_comment:
-        fixtures_soup = BeautifulSoup(fixtures_comment, 'lxml')
-        fixtures_table = fixtures_soup.find('table')
-    else:
-        # Fallback: look for fixtures table directly
-        fixtures_table = soup.find('table', {'id': lambda x: x and 'fixtures' in x.lower()})
-    
-    if fixtures_table and fixtures_table.tbody:
-        for row in fixtures_table.tbody.find_all('tr'):
-            cells = row.find_all(['td', 'th'])
-            if len(cells) >= 6:  # Ensure we have enough columns
-                try:
-                    # Extract match data (adjust indices based on actual FBref structure)
-                    date_cell = cells[1] if len(cells) > 1 else None
-                    home_team_cell = cells[3] if len(cells) > 3 else None
-                    away_team_cell = cells[5] if len(cells) > 5 else None
-                    
-                    if date_cell and home_team_cell and away_team_cell:
-                        # Parse date
-                        date_text = date_cell.get_text(strip=True)
-                        match_date = datetime.strptime(date_text, '%Y-%m-%d')
-                        
-                        if match_date >= cutoff_date:
-                            # Extract match URL for match_id
-                            match_link = row.find('a', href=lambda x: x and '/matches/' in x)
-                            match_id = None
-                            if match_link:
-                                href = match_link.get('href', '')
-                                match_id = href.split('/')[-2] if '/matches/' in href else None
-                            
-                            fixture = {
-                                'match_id': match_id,
-                                'match_date': match_date.strftime('%Y-%m-%d'),
-                                'home_team': home_team_cell.get_text(strip=True),
-                                'away_team': away_team_cell.get_text(strip=True),
-                                'league': league_name,
-                                'comp_id': comp_id
-                            }
-                            fixtures.append(fixture)
-                except (ValueError, AttributeError) as e:
-                    # Skip rows with parsing errors
-                    continue
-    
-    print(f"Found {len(fixtures)} recent fixtures for {league_name}")
-    return fixtures
-
-
-def scrape_match_logs(match_id: str, category: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Scrape match logs for a specific match and category.
-    Returns tuple of (team_stats_df, player_stats_df).
-    """
-    if category not in MATCH_LOG_CATEGORIES:
-        raise ValueError(f"Invalid category: {category}")
-    
-    category_path = MATCH_LOG_CATEGORIES[category]
-    url = f"{BASE_URL}/en/matches/{match_id}/{category_path}"
-    
-    print(f"Scraping {category} match logs for match {match_id}...")
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-    resp = get_with_retries(url)
-    soup = BeautifulSoup(resp.text, 'lxml')
-    
-    team_stats = pd.DataFrame()
-    player_stats = pd.DataFrame()
-    
-    # Extract team-level stats (if available)
-    team_table = soup.find('table', {'id': lambda x: x and 'team_stats' in str(x).lower()})
-    if team_table:
-        try:
-            team_stats = pd.read_html(str(team_table))[0]
-            team_stats['match_id'] = match_id
-            team_stats['category'] = category
-        except Exception as e:
-            print(f"Error parsing team stats for {match_id} {category}: {e}")
-    
-    # Extract player-level stats
-    player_tables = soup.find_all('table', {'id': lambda x: x and 'player' in str(x).lower()})
-    player_frames = []
-    
-    for table in player_tables:
-        try:
-            df = pd.read_html(str(table))[0]
-            df['match_id'] = match_id
-            df['category'] = category
+    for r in rows:
+        if r.get("class") == ["spacer"]:  # blank row
+            continue
             
-            # Determine team from table context
-            table_section = table.find_parent('div', class_='section_wrapper')
-            if table_section:
-                header = table_section.find('h2')
-                if header:
-                    team_name = header.get_text(strip=True).split(' ')[0]  # Extract team name
-                    df['team'] = team_name
-            
-            player_frames.append(df)
-        except Exception as e:
-            print(f"Error parsing player table for {match_id} {category}: {e}")
-    
-    if player_frames:
-        player_stats = pd.concat(player_frames, ignore_index=True)
-    
-    return team_stats, player_stats
-
-
-def get_all_recent_fixtures(days_back: int = 7) -> List[Dict]:
-    """
-    Get recent fixtures across all five leagues.
-    """
-    all_fixtures = []
-    for league_name, comp_id in LEAGUES.items():
-        try:
-            fixtures = get_recent_fixtures(league_name, comp_id, days_back)
-            all_fixtures.extend(fixtures)
-        except Exception as e:
-            print(f"Error getting fixtures for {league_name}: {e}")
-    
-    return all_fixtures
-
-
-def scrape_fixtures_for_category(fixtures: List[Dict], category: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Scrape a specific category for multiple fixtures.
-    Returns combined DataFrames for team and player stats.
-    """
-    team_frames = []
-    player_frames = []
-    
-    for fixture in fixtures:
-        match_id = fixture.get('match_id')
-        if not match_id:
+        date_cell = r.find("th", {"data-stat": "date"})
+        if not date_cell or date_cell.text.strip() == "":
             continue
             
         try:
-            team_df, player_df = scrape_match_logs(match_id, category)
+            match_date = date.fromisoformat(date_cell["csk"][:10])
+            if match_date < SINCE:
+                continue
+                
+            match_report_cell = r.find("td", {"data-stat": "match_report"})
+            if match_report_cell and match_report_cell.a:
+                slug = match_report_cell.a["href"]
+                urls.append(BASE + slug)
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning(f"Error parsing fixture row: {e}")
+            continue
+    
+    logger.info(f"Found {len(urls)} recent fixtures for league {league_id}")
+    return urls
+
+
+def get_all_recent_fixtures() -> List[str]:
+    """Get recent fixture URLs across all five leagues."""
+    current_year = date.today().year
+    # Handle season boundary (Aug-May)
+    if date.today().month >= 8:
+        season_year = current_year
+    else:
+        season_year = current_year - 1
+    
+    all_fixtures = []
+    for league_name, league_id in LEAGUES.items():
+        try:
+            fixtures = fixtures_since(league_id, season_year)
+            all_fixtures.extend(fixtures)
+        except Exception as e:
+            logger.error(f"Error getting fixtures for {league_name}: {e}")
+    
+    logger.info(f"Total recent fixtures across all leagues: {len(all_fixtures)}")
+    return all_fixtures
+
+
+def table_from_comment(html: str, wanted_id: str) -> pd.DataFrame:
+    """Extract table from HTML comment section."""
+    soup = BeautifulSoup(html, "lxml")
+    
+    try:
+        comment = next(
+            c for c in soup.find_all(string=lambda t: isinstance(t, Comment))
+            if wanted_id in c
+        )
+        inner = BeautifulSoup(comment, "lxml")
+        table = inner.find("table", id=wanted_id)
+        if table:
+            return pd.read_html(str(table))[0]
+    except (StopIteration, ValueError, IndexError) as e:
+        logger.warning(f"Could not extract table {wanted_id}: {e}")
+    
+    return pd.DataFrame()
+
+
+def extract_match_metadata(fixture_url: str) -> Dict:
+    """Extract match_id, teams, and season from fixture URL."""
+    # Example: /en/matches/abc123def/Arsenal-Chelsea-January-1-2025/
+    match_id = fixture_url.split('/matches/')[1].split('/')[0]
+    
+    # Get season year from current date
+    current_year = date.today().year
+    if date.today().month >= 8:
+        season_year = current_year + 1  # e.g., 2024-2025 season -> 2025
+    else:
+        season_year = current_year
+    
+    season_str = f"{season_year-1}-{season_year}"  # e.g., "2024-2025"
+    
+    return {
+        'match_id': match_id,
+        'season': season_year,
+        'season_str': season_str
+    }
+
+
+def get_teams_and_players_from_match(fixture_url: str) -> Tuple[List[Dict], List[Dict]]:
+    """Extract team IDs and player IDs from match page."""
+    soup = BeautifulSoup(get_with_retries(fixture_url).text, "lxml")
+    
+    teams = []
+    players = []
+    
+    # Find team links in lineups section
+    team_links = soup.find_all('a', href=re.compile(r'/en/squads/[^/]+/'))
+    seen_teams = set()
+    
+    for link in team_links:
+        href = link['href']
+        team_id = href.split('/squads/')[1].split('/')[0]
+        team_name = link.text.strip()
+        
+        if team_id not in seen_teams:
+            teams.append({
+                'team_id': team_id,
+                'team_name': team_name,
+                'team_slug': href.split('/')[-1]  # last part of URL
+            })
+            seen_teams.add(team_id)
+    
+    # Find player links in starting XI tables
+    player_links = soup.find_all('a', href=re.compile(r'/en/players/[^/]+/'))
+    seen_players = set()
+    
+    for link in player_links:
+        href = link['href']
+        player_id = href.split('/players/')[1].split('/')[0]
+        player_name = link.text.strip()
+        
+        if player_id not in seen_players and player_name:
+            players.append({
+                'player_id': player_id,
+                'player_name': player_name,
+                'player_slug': href.split('/')[-1]  # last part of URL
+            })
+            seen_players.add(player_id)
+    
+    return teams, players
+
+
+def scrape_team_match_logs(teams: List[Dict], category: str, metadata: Dict) -> pd.DataFrame:
+    """Scrape team match logs for a category."""
+    code, cat_path = CODES[category]
+    season_str = metadata['season_str']
+    match_id = metadata['match_id']
+    
+    team_frames = []
+    
+    for team in teams:
+        try:
+            url = TEAM_TMPL.format(
+                tid=team['team_id'],
+                season=season_str,
+                code=code,
+                cat=cat_path,
+                team_slug=team['team_slug']
+            )
             
-            # Add fixture metadata
-            for df in [team_df, player_df]:
-                if not df.empty:
-                    df['league'] = fixture['league']
-                    df['match_date'] = fixture['match_date']
+            logger.info(f"Fetching team {category} data: {team['team_name']}")
+            html = get_with_retries(url).text
             
-            if not team_df.empty:
-                team_frames.append(team_df)
-            if not player_df.empty:
-                player_frames.append(player_df)
+            # For teams, use "matchlogs_{category}_squads" (the "For" table)
+            table_id = f"matchlogs_{cat_path}_squads"
+            df = table_from_comment(html, table_id)
+            
+            if not df.empty:
+                # Filter to league matches only
+                if 'Comp' in df.columns:
+                    df = df[df['Comp'].isin(LEAGUE_NAMES)]
+                
+                # Add metadata
+                df['match_id'] = match_id
+                df['team_id'] = team['team_id']
+                df['team_name'] = team['team_name']
+                df['category'] = category
+                df['season'] = metadata['season']
+                df['created_at'] = pd.Timestamp.utcnow()
+                df['updated_at'] = pd.Timestamp.utcnow()
+                
+                team_frames.append(df)
                 
         except Exception as e:
-            print(f"Error scraping {category} for match {match_id}: {e}")
+            logger.error(f"Error scraping team {team['team_name']} {category}: {e}")
     
-    # Combine all matches
-    combined_team = pd.concat(team_frames, ignore_index=True) if team_frames else pd.DataFrame()
-    combined_player = pd.concat(player_frames, ignore_index=True) if player_frames else pd.DataFrame()
+    if team_frames:
+        combined = pd.concat(team_frames, ignore_index=True)
+        # Convert numeric columns
+        numeric_cols = combined.select_dtypes('object').columns
+        combined[numeric_cols] = combined[numeric_cols].apply(pd.to_numeric, errors='ignore')
+        return combined
     
-    return combined_team, combined_player
+    return pd.DataFrame()
+
+
+def scrape_player_match_logs(players: List[Dict], category: str, metadata: Dict) -> pd.DataFrame:
+    """Scrape player match logs for a category."""
+    code, cat_path = CODES[category]
+    season_str = metadata['season_str']
+    match_id = metadata['match_id']
+    
+    player_frames = []
+    
+    for player in players:
+        try:
+            url = PLYR_TMPL.format(
+                pid=player['player_id'],
+                season=season_str,
+                cat=cat_path,
+                player_slug=player['player_slug']
+            )
+            
+            logger.info(f"Fetching player {category} data: {player['player_name']}")
+            html = get_with_retries(url).text
+            
+            # For players, use "matchlogs_{category}"
+            table_id = f"matchlogs_{cat_path}"
+            df = table_from_comment(html, table_id)
+            
+            if not df.empty:
+                # Filter to league matches only
+                if 'Comp' in df.columns:
+                    df = df[df['Comp'].isin(LEAGUE_NAMES)]
+                
+                # Add metadata
+                df['match_id'] = match_id
+                df['player_id'] = player['player_id']
+                df['player_name'] = player['player_name']
+                df['category'] = category
+                df['season'] = metadata['season']
+                df['created_at'] = pd.Timestamp.utcnow()
+                df['updated_at'] = pd.Timestamp.utcnow()
+                
+                player_frames.append(df)
+                
+        except Exception as e:
+            logger.error(f"Error scraping player {player['player_name']} {category}: {e}")
+    
+    if player_frames:
+        combined = pd.concat(player_frames, ignore_index=True)
+        # Convert numeric columns
+        numeric_cols = combined.select_dtypes('object').columns
+        combined[numeric_cols] = combined[numeric_cols].apply(pd.to_numeric, errors='ignore')
+        return combined
+    
+    return pd.DataFrame()
+
+
+def dtype_sql(series: pd.Series) -> str:
+    """Map pandas dtype to SQL type."""
+    if pd.api.types.is_integer_dtype(series):
+        return "INTEGER"
+    elif pd.api.types.is_float_dtype(series):
+        return "REAL"
+    elif pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+    elif pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    else:
+        return "TEXT"
+
+
+def upsert_dataframe(df: pd.DataFrame, target_table: str, pk_cols: List[str], engine):
+    """Upsert DataFrame using temporary staging table."""
+    if df.empty:
+        logger.warning(f"Empty DataFrame for {target_table}, skipping upsert")
+        return
+    
+    with engine.begin() as conn:
+        # 1) Create temporary staging table
+        col_defs = ', '.join(f'{c} {dtype_sql(df[c])}' for c in df.columns)
+        conn.execute(text(f"CREATE TEMP TABLE stg ({col_defs}) ON COMMIT DROP;"))
+        
+        # 2) Load data into staging
+        df.to_sql("stg", conn, if_exists="append", index=False)
+        
+        # 3) Merge via UPSERT
+        col_list = ", ".join(df.columns)
+        set_list = ", ".join(f"{c}=EXCLUDED.{c}" for c in df.columns if c not in pk_cols)
+        pk = ", ".join(pk_cols)
+        
+        upsert_sql = f"""
+            INSERT INTO {target_table} ({col_list})
+            SELECT {col_list} FROM stg
+            ON CONFLICT ({pk}) DO UPDATE SET {set_list};
+        """
+        
+        result = conn.execute(text(upsert_sql))
+        logger.info(f"Upserted {result.rowcount} rows to {target_table}")
+
+
+def scrape_category_for_fixtures(fixtures: List[str], category: str, engine) -> Tuple[int, int]:
+    """Scrape one category across all fixtures and load to database."""
+    logger.info(f"Scraping {category} category for {len(fixtures)} fixtures")
+    
+    team_rows = 0
+    player_rows = 0
+    
+    for fixture_url in fixtures:
+        try:
+            # Extract metadata
+            metadata = extract_match_metadata(fixture_url)
+            
+            # Get teams and players from match page
+            teams, players = get_teams_and_players_from_match(fixture_url)
+            
+            # Scrape team data
+            team_df = scrape_team_match_logs(teams, category, metadata)
+            if not team_df.empty:
+                upsert_dataframe(
+                    team_df, 
+                    "team_match_stats",
+                    ["match_id", "team_id", "category"],
+                    engine
+                )
+                team_rows += len(team_df)
+            
+            # Scrape player data  
+            player_df = scrape_player_match_logs(players, category, metadata)
+            if not player_df.empty:
+                upsert_dataframe(
+                    player_df,
+                    "player_match_stats", 
+                    ["match_id", "player_id", "category"],
+                    engine
+                )
+                player_rows += len(player_df)
+                
+        except Exception as e:
+            logger.error(f"Error processing fixture {fixture_url}: {e}")
+    
+    logger.info(f"Category {category}: {team_rows} team rows, {player_rows} player rows")
+    return team_rows, player_rows
 
 
 if __name__ == "__main__":
     # Test functionality
-    fixtures = get_all_recent_fixtures(days_back=7)
-    print(f"Found {len(fixtures)} total recent fixtures")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    print("Testing FBref scraper...")
+    
+    # Test fixture discovery
+    fixtures = get_all_recent_fixtures()
+    print(f"Found {len(fixtures)} recent fixtures")
     
     if fixtures:
-        # Test scraping one category
-        team_df, player_df = scrape_fixtures_for_category(fixtures[:2], 'passing')
-        print(f"Team stats shape: {team_df.shape}")
-        print(f"Player stats shape: {player_df.shape}") 
+        # Test metadata extraction
+        metadata = extract_match_metadata(fixtures[0])
+        print(f"Sample metadata: {metadata}")
+        
+        # Test team/player extraction
+        teams, players = get_teams_and_players_from_match(fixtures[0])
+        print(f"Found {len(teams)} teams, {len(players)} players")
+        
+        # Test scraping one category (without database)
+        if teams:
+            team_df = scrape_team_match_logs(teams[:1], 'passing', metadata)
+            print(f"Sample team data shape: {team_df.shape}")
+            
+        if players:
+            player_df = scrape_player_match_logs(players[:2], 'passing', metadata)
+            print(f"Sample player data shape: {player_df.shape}") 

@@ -1,195 +1,186 @@
 #!/usr/bin/env python3
 """
-FBref Weekly Update Script
-Runs every Monday to fetch match data from the previous 7 days
-and load it into Supabase using temporary staging tables.
+Weekly FBref data update script.
+Runs every Monday at 03:15 to collect match-log data from the last 7 days.
 """
 
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict
 import traceback
+from datetime import datetime
+from typing import Dict, Any
 
-# Import our modules
-from scraper import get_all_recent_fixtures, scrape_fixtures_for_category, MATCH_LOG_CATEGORIES
+from scraper import get_all_recent_fixtures, scrape_category_for_fixtures, CODES
 from db import SupabaseDB
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/var/log/fbref_update.log', mode='a'),
-        logging.StreamHandler(sys.stdout)
+
+def setup_logging() -> logging.Logger:
+    """Configure logging for the update script."""
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(log_format))
+    
+    # File handler (if in production)
+    handlers = [console_handler]
+    if os.path.exists('/var/log'):
+        file_handler = logging.FileHandler('/var/log/fbref_update.log')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        handlers.append(file_handler)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=handlers,
+        force=True
+    )
+    
+    return logging.getLogger(__name__)
+
+
+def validate_environment() -> bool:
+    """Check that all required environment variables are present."""
+    required_vars = [
+        'SUPABASE_HOST',
+        'SUPABASE_DB_NAME', 
+        'SUPABASE_USER',
+        'SUPABASE_PASSWORD'
     ]
-)
-logger = logging.getLogger(__name__)
-
-
-def load_environment():
-    """
-    Load environment variables from .env file if it exists.
-    """
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        logger.info("Environment variables loaded from .env file")
-    except ImportError:
-        logger.info("python-dotenv not available, using system environment variables")
-
-
-def validate_environment():
-    """
-    Validate that required environment variables are set.
-    """
-    required_vars = ['SUPABASE_DB_URL']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
     
-    if missing_vars:
-        raise ValueError(f"Missing required environment variables: {missing_vars}")
-    
-    logger.info("Environment validation passed")
-
-
-def get_fixture_window_logic() -> List[Dict]:
-    """
-    Implement fixture-window logic to identify matches from the last 7 days.
-    Returns list of fixtures to process.
-    """
-    logger.info("Fetching fixtures from the last 7 days...")
-    
-    try:
-        fixtures = get_all_recent_fixtures(days_back=7)
-        
-        # Filter to ensure we only get league matches
-        valid_leagues = {'Premier League', 'La Liga', 'Bundesliga', 'Serie A', 'Ligue 1'}
-        filtered_fixtures = [
-            fixture for fixture in fixtures 
-            if fixture.get('league') in valid_leagues and fixture.get('match_id')
-        ]
-        
-        logger.info(f"Found {len(filtered_fixtures)} valid league fixtures from the last 7 days")
-        
-        # Log fixture summary
-        league_counts = {}
-        for fixture in filtered_fixtures:
-            league = fixture.get('league', 'Unknown')
-            league_counts[league] = league_counts.get(league, 0) + 1
-        
-        for league, count in league_counts.items():
-            logger.info(f"  {league}: {count} fixtures")
-        
-        return filtered_fixtures
-        
-    except Exception as e:
-        logger.error(f"Error fetching fixtures: {e}")
-        logger.error(traceback.format_exc())
-        return []
-
-
-def process_category(fixtures: List[Dict], category: str, db: SupabaseDB) -> bool:
-    """
-    Process a single category for all fixtures.
-    Returns True if successful, False otherwise.
-    """
-    try:
-        logger.info(f"Processing category: {category}")
-        
-        # Scrape data for this category
-        team_df, player_df = scrape_fixtures_for_category(fixtures, category)
-        
-        logger.info(f"Scraped {len(team_df)} team records and {len(player_df)} player records for {category}")
-        
-        # Load into database using temporary staging
-        if not team_df.empty:
-            db.bulk_upsert_team_stats(team_df, category)
-        
-        if not player_df.empty:
-            db.bulk_upsert_player_stats(player_df, category)
-        
-        logger.info(f"Successfully processed category: {category}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error processing category {category}: {e}")
-        logger.error(traceback.format_exc())
+    missing = [var for var in required_vars if not os.environ.get(var)]
+    if missing:
+        print(f"Missing required environment variables: {missing}")
         return False
+    
+    return True
+
+
+def run_weekly_update() -> Dict[str, Any]:
+    """
+    Main update logic: discover recent fixtures and scrape all categories.
+    Returns summary statistics.
+    """
+    logger = logging.getLogger(__name__)
+    
+    # Initialize database connection
+    logger.info("Connecting to Supabase...")
+    db = SupabaseDB()
+    
+    try:
+        # Ensure tables exist
+        db.create_tables()
+        logger.info("Database tables verified")
+        
+        # Get recent fixtures
+        logger.info("Discovering recent fixtures...")
+        fixtures = get_all_recent_fixtures()
+        
+        if not fixtures:
+            logger.warning("No recent fixtures found")
+            return {'status': 'success', 'fixtures': 0, 'categories': 0, 'total_rows': 0}
+        
+        logger.info(f"Found {len(fixtures)} recent fixtures")
+        
+        # Process each category
+        results = {}
+        total_team_rows = 0
+        total_player_rows = 0
+        
+        for category in CODES.keys():
+            logger.info(f"Processing category: {category}")
+            
+            try:
+                team_rows, player_rows = scrape_category_for_fixtures(
+                    fixtures, category, db.engine
+                )
+                
+                results[category] = {
+                    'team_rows': team_rows,
+                    'player_rows': player_rows,
+                    'status': 'success'
+                }
+                
+                total_team_rows += team_rows
+                total_player_rows += player_rows
+                
+                logger.info(f"Category {category} completed: {team_rows} team rows, {player_rows} player rows")
+                
+            except Exception as e:
+                logger.error(f"Error processing category {category}: {e}")
+                results[category] = {
+                    'team_rows': 0,
+                    'player_rows': 0,
+                    'status': 'error',
+                    'error': str(e)
+                }
+        
+        # Summary
+        successful_categories = sum(1 for r in results.values() if r['status'] == 'success')
+        
+        summary = {
+            'status': 'success',
+            'timestamp': datetime.utcnow().isoformat(),
+            'fixtures_processed': len(fixtures),
+            'categories_processed': successful_categories,
+            'total_categories': len(CODES),
+            'total_team_rows': total_team_rows,
+            'total_player_rows': total_player_rows,
+            'category_results': results
+        }
+        
+        logger.info(f"Update completed successfully:")
+        logger.info(f"  - Fixtures: {len(fixtures)}")
+        logger.info(f"  - Categories: {successful_categories}/{len(CODES)}")
+        logger.info(f"  - Team rows: {total_team_rows}")
+        logger.info(f"  - Player rows: {total_player_rows}")
+        
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Update failed: {e}")
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }
+    
+    finally:
+        db.close()
+        logger.info("Database connection closed")
 
 
 def main():
-    """
-    Main execution function for the weekly update.
-    """
-    start_time = datetime.now()
-    logger.info("=" * 50)
-    logger.info(f"Starting FBref weekly update at {start_time}")
-    logger.info("=" * 50)
+    """Main entry point."""
+    logger = setup_logging()
+    logger.info("=== FBref Weekly Update Started ===")
     
+    # Validate environment
+    if not validate_environment():
+        logger.error("Environment validation failed")
+        sys.exit(1)
+    
+    # Run update
     try:
-        # Load and validate environment
-        load_environment()
-        validate_environment()
+        results = run_weekly_update()
         
-        # Initialize database connection
-        logger.info("Initializing database connection...")
-        db = SupabaseDB()
-        
-        # Get initial table stats
-        initial_stats = db.get_table_stats()
-        logger.info(f"Initial table counts: {initial_stats}")
-        
-        # Get fixtures for the last week
-        fixtures = get_fixture_window_logic()
-        
-        if not fixtures:
-            logger.warning("No fixtures found for the last 7 days. Exiting.")
-            return
-        
-        # Process each category
-        success_count = 0
-        total_categories = len(MATCH_LOG_CATEGORIES)
-        
-        for category in MATCH_LOG_CATEGORIES.keys():
-            success = process_category(fixtures, category, db)
-            if success:
-                success_count += 1
-        
-        # Get final table stats
-        final_stats = db.get_table_stats()
-        logger.info(f"Final table counts: {final_stats}")
-        
-        # Calculate changes
-        team_added = final_stats['team_match_stats'] - initial_stats['team_match_stats']
-        player_added = final_stats['player_match_stats'] - initial_stats['player_match_stats']
-        
-        logger.info(f"Records added - Team: {team_added}, Player: {player_added}")
-        
-        # Close database connection
-        db.close()
-        
-        # Summary
-        end_time = datetime.now()
-        duration = end_time - start_time
-        
-        logger.info("=" * 50)
-        logger.info(f"Weekly update completed at {end_time}")
-        logger.info(f"Duration: {duration}")
-        logger.info(f"Categories processed successfully: {success_count}/{total_categories}")
-        logger.info(f"Total fixtures processed: {len(fixtures)}")
-        logger.info("=" * 50)
-        
-        # Exit with appropriate code
-        if success_count == total_categories:
-            logger.info("All categories processed successfully")
+        if results['status'] == 'success':
+            logger.info("=== FBref Weekly Update Completed Successfully ===")
             sys.exit(0)
         else:
-            logger.warning(f"Only {success_count}/{total_categories} categories processed successfully")
+            logger.error("=== FBref Weekly Update Failed ===")
+            logger.error(f"Error: {results.get('error', 'Unknown error')}")
             sys.exit(1)
             
+    except KeyboardInterrupt:
+        logger.info("Update interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Fatal error in weekly update: {e}")
+        logger.error(f"Unexpected error: {e}")
         logger.error(traceback.format_exc())
         sys.exit(1)
 
