@@ -1,262 +1,198 @@
-
+#!/usr/bin/env python3
 """
-fbref_update.py
-
-Weekly updater for FBref player and team statistics.
-
-Features
---------
-* Scrapes player AND team (squad) statistics for the current season across the
-  top‑5 European leagues (Premier League, La Liga, Bundesliga, Serie A, Ligue 1).
-* Writes each dataset to a relational database (SQLite, PostgreSQL, etc.)
-  using SQLAlchemy.  Table names follow the pattern <kind>_<category> (e.g.
-  player_standard, team_passing).
-* Designed for incremental weekly runs: if the table already exists the script
-  drops it and replaces it with the fresh scrape, so you always have a clean,
-  up‑to‑date snapshot.
-* Respects FBref’s rate‑limits with randomised delays and exponential back‑off.
-* Minimal dependencies: pandas, requests, cloudscraper, SQLAlchemy, beautifulsoup4.
-* Can be scheduled via `cron` (example included) or run manually.
-
-Usage
------
-# First time: install requirements
-$ pip install -r requirements.txt
-
-# Run and write to a local SQLite DB
-$ python fbref_update.py --db sqlite:///fbref.db
-
-# Run and write to PostgreSQL (ensure DB exists and you have permission)
-$ python fbref_update.py --db postgresql://user:password@localhost:5432/fbref
-
-# Cron example: every Monday at 03:15
-# 15 3 * * MON /usr/bin/python3 /path/to/fbref_update.py --db sqlite:///fbref.db >> /var/log/fbref_update.log 2>&1
+FBref Weekly Update Script
+Runs every Monday to fetch match data from the previous 7 days
+and load it into Supabase using temporary staging tables.
 """
 
-import argparse
-import logging
 import os
-import random
-import time
-from datetime import datetime
-import numpy as np
-from typing import Dict, List
+import sys
+import logging
+from datetime import datetime, timedelta
+from typing import List, Dict
+import traceback
 
-import cloudscraper
-import pandas as pd
-import requests
-import sqlalchemy
-from bs4 import BeautifulSoup, Comment
-from sqlalchemy.engine import Engine
-import numpy as np
-import certifi
-from io import StringIO
+# Import our modules
+from scraper import get_all_recent_fixtures, scrape_fixtures_for_category, MATCH_LOG_CATEGORIES
+from db import SupabaseDB
 
-
-BASE_URL = "https://fbref.com"
-
-LEAGUES: Dict[str, int] = {
-    "Premier League": 9,
-    "La Liga": 12,
-    "Bundesliga": 20,
-    "Serie A": 11,
-    "Ligue 1": 13,
-}
-
-PLAYER_CATEGORIES: Dict[str, str] = {
-    "standard": "",
-    "shooting": "shooting",
-    "passing": "passing",
-    "passing_types": "passing_types",
-    "gca": "gca",
-    "defense": "defense",
-    "possession": "possession",
-    "misc": "misc",
-}
-
-# Team (squad) categories share the same segments as the player pages
-TEAM_CATEGORIES: Dict[str, str] = PLAYER_CATEGORIES.copy()
-
-# Throttling - Increased delays to be more respectful of fbref.com
-DELAY_MIN = 3.0
-DELAY_MAX = 6.0
-MAX_RETRIES = 5
-BACKOFF_FACTOR = 2.0
-
-# --------------------------------------------------------------------------- #
-# Helper functions
-# --------------------------------------------------------------------------- #
-
-def create_scraper() -> cloudscraper.CloudScraper:
-    """Return a CloudScraper session with a desktop Chrome profile."""
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "desktop": True}
-    )
-    # Configure SSL verification with certifi certificates
-    scraper.verify = certifi.where()
-    return scraper
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/var/log/fbref_update.log', mode='a'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
-scraper = create_scraper()
+def load_environment():
+    """
+    Load environment variables from .env file if it exists.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        logger.info("Environment variables loaded from .env file")
+    except ImportError:
+        logger.info("python-dotenv not available, using system environment variables")
 
 
-def get_with_retries(url: str, referer: str | None = None) -> requests.Response:
-    """GET *url* with retries + exponential back‑off."""
-    last_err: Exception | None = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            headers = {"User-Agent": scraper.headers["User-Agent"]}
-            if referer:
-                headers["Referer"] = referer
-            resp = scraper.get(url, headers=headers, timeout=30)
-            if resp.status_code == 429:
-                raise requests.exceptions.HTTPError("429 Too Many Requests")
-            resp.raise_for_status()
-            return resp
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-            wait = BACKOFF_FACTOR ** (attempt - 1) + random.uniform(0, 1)
-            logging.warning("[%s] %s – retrying in %.1fs", attempt, url, wait)
-            time.sleep(wait)
-    assert last_err is not None
-    raise last_err
+def validate_environment():
+    """
+    Validate that required environment variables are set.
+    """
+    required_vars = ['SUPABASE_DB_URL']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        raise ValueError(f"Missing required environment variables: {missing_vars}")
+    
+    logger.info("Environment validation passed")
 
 
-def extract_table(soup: BeautifulSoup, block_id: str, table_prefix: str) -> pd.DataFrame:
-    """Return a DataFrame of the first table that matches *block_id* or *table_prefix*."""
-    comment = soup.find(
-        string=lambda t: isinstance(t, Comment) and block_id in t  # type: ignore[arg-type]
-    )
-    if comment:
-        inner = BeautifulSoup(comment, "lxml").find("table")
-    else:
-        inner = soup.find("table", id=lambda x: x and x.startswith(table_prefix))
-    if inner is None or inner.tbody is None:
-        return pd.DataFrame()
-    return pd.read_html(StringIO(str(inner)))[0]
-
-
-def scrape_player_category(
-    league: str, comp_id: int, category_key: str
-) -> pd.DataFrame:
-    """Scrape *category_key* player stats for *league*."""
-    segment = PLAYER_CATEGORIES[category_key]
-    path = f"{segment}/" if segment else ""
-    url = f"{BASE_URL}/en/comps/{comp_id}/{path}{league.replace(' ', '-')}-Stats"
-    logging.info("Player %s – %s", league, category_key)
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-    resp = get_with_retries(url)
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    df = extract_table(soup, f"div_stats_{segment or 'standard'}", "stats_")
-    if df.empty:
-        logging.warning("No player table found for %s %s", league, category_key)
-        return df
-
-    df["league"] = league
-    df["season"] = datetime.now().year  # crude but adequate for weekly refresh
-    df["category"] = category_key
-    return df
-
-
-def scrape_team_category(
-    league: str, comp_id: int, category_key: str
-) -> pd.DataFrame:
-    """Scrape *category_key* squad stats for *league*."""
-    # Team stats live on the same pages as player stats
-    segment = TEAM_CATEGORIES[category_key]
-    path = f"{segment}/" if segment else ""
-    url = f"{BASE_URL}/en/comps/{comp_id}/{path}{league.replace(' ', '-')}-Stats"
-    logging.info("Team %s – %s", league, category_key)
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-    resp = get_with_retries(url)
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    df = extract_table(
-        soup, f"div_stats_squads_{segment or 'standard'}", "stats_squads_"
-    )
-    if df.empty:
-        logging.warning("No team table found for %s %s", league, category_key)
-        return df
-
-    df["league"] = league
-    df["season"] = datetime.now().year
-    df["category"] = category_key
-    return df
-
-
-def combine_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
-    """Concatenate *frames* ignoring index; return empty DF if all empty."""
-    frames = [f for f in frames if not f.empty]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
-# --------------------------------------------------------------------------- #
-# Database helpers
-# --------------------------------------------------------------------------- #
-
-def init_engine(db_url: str) -> Engine:
-    """Return a SQLAlchemy engine for *db_url*."""
-    return sqlalchemy.create_engine(db_url, future=True)
-
-
-def write_frame(df: pd.DataFrame, name: str, engine: Engine) -> None:
-    """Write *df* to *name* in *engine*, replacing existing table."""
-    if df.empty:
-        logging.warning("%s empty – skipping write", name)
-        return
-    df.to_sql(name, engine, if_exists="replace", index=False)
-    logging.info("Wrote %s (%d rows)", name, len(df))
-
-
-# --------------------------------------------------------------------------- #
-# Main runner
-# --------------------------------------------------------------------------- #
-
-def run(db_url: str) -> None:
-    engine = init_engine(db_url)
-
-    for cat in PLAYER_CATEGORIES:
-        player_frames = [
-            scrape_player_category(league, comp, cat) for league, comp in LEAGUES.items()
+def get_fixture_window_logic() -> List[Dict]:
+    """
+    Implement fixture-window logic to identify matches from the last 7 days.
+    Returns list of fixtures to process.
+    """
+    logger.info("Fetching fixtures from the last 7 days...")
+    
+    try:
+        fixtures = get_all_recent_fixtures(days_back=7)
+        
+        # Filter to ensure we only get league matches
+        valid_leagues = {'Premier League', 'La Liga', 'Bundesliga', 'Serie A', 'Ligue 1'}
+        filtered_fixtures = [
+            fixture for fixture in fixtures 
+            if fixture.get('league') in valid_leagues and fixture.get('match_id')
         ]
-        combined = combine_frames(player_frames)
-        write_frame(combined, f"player_{cat}", engine)
-
-    for cat in TEAM_CATEGORIES:
-        team_frames = [
-            scrape_team_category(league, comp, cat) for league, comp in LEAGUES.items()
-        ]
-        combined = combine_frames(team_frames)
-        write_frame(combined, f"team_{cat}", engine)
-
-
-def cli() -> None:
-    parser = argparse.ArgumentParser(
-        description="Weekly FBref updater (player + team stats)"
-    )
-    parser.add_argument(
-        "--db",
-        default="sqlite:///fbref.db",
-        help="SQLAlchemy‑compatible database URL (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity",
-    )
-    args = parser.parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-
-    logging.info("Starting FBref update → %s", args.db)
-    start = time.time()
-    run(args.db)
-    logging.info("Finished in %.1fs", time.time() - start)
+        
+        logger.info(f"Found {len(filtered_fixtures)} valid league fixtures from the last 7 days")
+        
+        # Log fixture summary
+        league_counts = {}
+        for fixture in filtered_fixtures:
+            league = fixture.get('league', 'Unknown')
+            league_counts[league] = league_counts.get(league, 0) + 1
+        
+        for league, count in league_counts.items():
+            logger.info(f"  {league}: {count} fixtures")
+        
+        return filtered_fixtures
+        
+    except Exception as e:
+        logger.error(f"Error fetching fixtures: {e}")
+        logger.error(traceback.format_exc())
+        return []
 
 
-if __name__ == "__main__":  # pragma: no cover
-    cli()
+def process_category(fixtures: List[Dict], category: str, db: SupabaseDB) -> bool:
+    """
+    Process a single category for all fixtures.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        logger.info(f"Processing category: {category}")
+        
+        # Scrape data for this category
+        team_df, player_df = scrape_fixtures_for_category(fixtures, category)
+        
+        logger.info(f"Scraped {len(team_df)} team records and {len(player_df)} player records for {category}")
+        
+        # Load into database using temporary staging
+        if not team_df.empty:
+            db.bulk_upsert_team_stats(team_df, category)
+        
+        if not player_df.empty:
+            db.bulk_upsert_player_stats(player_df, category)
+        
+        logger.info(f"Successfully processed category: {category}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error processing category {category}: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+def main():
+    """
+    Main execution function for the weekly update.
+    """
+    start_time = datetime.now()
+    logger.info("=" * 50)
+    logger.info(f"Starting FBref weekly update at {start_time}")
+    logger.info("=" * 50)
+    
+    try:
+        # Load and validate environment
+        load_environment()
+        validate_environment()
+        
+        # Initialize database connection
+        logger.info("Initializing database connection...")
+        db = SupabaseDB()
+        
+        # Get initial table stats
+        initial_stats = db.get_table_stats()
+        logger.info(f"Initial table counts: {initial_stats}")
+        
+        # Get fixtures for the last week
+        fixtures = get_fixture_window_logic()
+        
+        if not fixtures:
+            logger.warning("No fixtures found for the last 7 days. Exiting.")
+            return
+        
+        # Process each category
+        success_count = 0
+        total_categories = len(MATCH_LOG_CATEGORIES)
+        
+        for category in MATCH_LOG_CATEGORIES.keys():
+            success = process_category(fixtures, category, db)
+            if success:
+                success_count += 1
+        
+        # Get final table stats
+        final_stats = db.get_table_stats()
+        logger.info(f"Final table counts: {final_stats}")
+        
+        # Calculate changes
+        team_added = final_stats['team_match_stats'] - initial_stats['team_match_stats']
+        player_added = final_stats['player_match_stats'] - initial_stats['player_match_stats']
+        
+        logger.info(f"Records added - Team: {team_added}, Player: {player_added}")
+        
+        # Close database connection
+        db.close()
+        
+        # Summary
+        end_time = datetime.now()
+        duration = end_time - start_time
+        
+        logger.info("=" * 50)
+        logger.info(f"Weekly update completed at {end_time}")
+        logger.info(f"Duration: {duration}")
+        logger.info(f"Categories processed successfully: {success_count}/{total_categories}")
+        logger.info(f"Total fixtures processed: {len(fixtures)}")
+        logger.info("=" * 50)
+        
+        # Exit with appropriate code
+        if success_count == total_categories:
+            logger.info("All categories processed successfully")
+            sys.exit(0)
+        else:
+            logger.warning(f"Only {success_count}/{total_categories} categories processed successfully")
+            sys.exit(1)
+            
+    except Exception as e:
+        logger.error(f"Fatal error in weekly update: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main() 
