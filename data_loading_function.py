@@ -79,14 +79,22 @@ def load_player_data(table_name="big5_players_comprehensive"):
     
     print(f"\nTable shape: {df.shape}")
     
-    # Clean up unnamed columns
+    # Clean up unnamed columns - but avoid creating duplicates
     rename_dict = {}
+    new_names_used = set()
+    
     for col in df.columns:
         if "unnamed" in col.lower():
             original_col = col
             new_col = col.strip('_')
             new_col = new_col.split('_')[-1]
+            
+            # If this new name would create a duplicate, make it unique
+            if new_col in new_names_used or new_col in df.columns:
+                new_col = f"{new_col}_{col.split('_')[2]}"  # Use the number part to make it unique
+            
             rename_dict[original_col] = new_col
+            new_names_used.add(new_col)
     
     if rename_dict:
         df.rename(columns=rename_dict, inplace=True)
@@ -215,7 +223,7 @@ def load_player_data(table_name="big5_players_comprehensive"):
     # Simple rename - only rename columns that exist in the mapping
     df = df.rename(columns=COLUMN_MAPPING, errors="ignore")
     
-    # Handle duplicate column names
+    # Handle duplicate column names - but be smart about which ones to keep
     duplicate_cols = df.columns[df.columns.duplicated()].tolist()
     if duplicate_cols:
         
@@ -224,11 +232,43 @@ def load_player_data(table_name="big5_players_comprehensive"):
         duplicated_names = {name: count for name, count in col_counts.items() if count > 1}
         print(f"Column name frequencies: {duplicated_names}")
         
-        # Remove duplicate columns (keep first occurrence)
+        # For 90s column specifically, keep the one that came from playing_time_90s
+        if '90s' in duplicated_names:
+            # Get all 90s column positions
+            nineties_positions = [i for i, col in enumerate(df.columns) if col == '90s']
+            
+            # Find the one with the most non-zero values (likely the correct one)
+            best_90s_idx = None
+            max_non_zero = 0
+            
+            for pos in nineties_positions:
+                non_zero_count = (df.iloc[:, pos] > 0).sum()
+                if non_zero_count > max_non_zero:
+                    max_non_zero = non_zero_count
+                    best_90s_idx = pos
+            
+            if best_90s_idx is not None:
+                # Keep only the best 90s column
+                cols_to_keep = []
+                nineties_kept = False
+                for i, col in enumerate(df.columns):
+                    if col == '90s':
+                        if i == best_90s_idx and not nineties_kept:
+                            cols_to_keep.append(True)
+                            nineties_kept = True
+                        else:
+                            cols_to_keep.append(False)
+                    else:
+                        cols_to_keep.append(True)
+                
+                df = df.loc[:, cols_to_keep]
+        
+        # Remove remaining duplicate columns (keep first occurrence)
         df = df.loc[:, ~df.columns.duplicated()]
     else:
         print("\nNo duplicate column names found.")
     
+    # Fill NaN values with 0 - but be careful not to overwrite real data
     df = df.fillna(0)
     
     return df
