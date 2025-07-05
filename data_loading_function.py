@@ -1,6 +1,7 @@
 # Simple Supabase Connection and Data Loading Function
 import os
 import pandas as pd
+import numpy as np
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import re
@@ -268,7 +269,17 @@ def load_player_data(table_name="big5_players_comprehensive"):
     else:
         print("\nNo duplicate column names found.")
     
-    # Fill NaN values with 0 - but be careful not to overwrite real data
-    df = df.fillna(0)
+    # Fill missing values more comprehensively
+    # First, replace various representations of missing values
+    df = df.replace(['', 'NaN', 'nan', 'NULL', 'null', 'None', 'none'], np.nan)
+    
+    # Then fill remaining NaN/NA values with 0 for numeric columns, empty string for text columns
+    for col in df.columns:
+        if df[col].dtype in ['object', 'string']:
+            # For text columns, fill with empty string
+            df[col] = df[col].fillna('')
+        else:
+            # For numeric columns, fill with 0
+            df[col] = df[col].fillna(0)
     
     return df
