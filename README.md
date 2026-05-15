@@ -29,7 +29,7 @@ The project uses football event and performance data to group players based on s
 
 ## Data Sources
 
-- FBref statistical datasets
+- FBref data (when it was still available
 - StatsBomb event data
 
 ## Goal
